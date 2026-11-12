@@ -1,0 +1,639 @@
+"""File-based IPC backend for AutoCAD / AutoCAD LT (Windows) and AutoCAD for Mac.
+
+Protocol:
+1. Python writes JSON command to {IPC_DIR}/autocad_mcp_cmd_{request_id}.json
+   (C:/temp on Windows, /tmp/autocad_mcp on Mac)
+2. Python triggers the dispatcher: "(c:mcp-dispatch)" + Enter on Windows,
+   the MCPD alias typed via System Events on Mac (see autocad_mcp.macos)
+3. LISP reads cmd, dispatches via command map, writes result to
+   {IPC_DIR}/autocad_mcp_result_{request_id}.json
+4. Python polls for result file (100ms intervals, 10s timeout)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+import structlog
+
+from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
+from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
+
+log = structlog.get_logger()
+
+# IPC settings
+POLL_INTERVAL = 0.1  # seconds
+TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
+
+# --- Bổ sung bản HP: đọc kết quả LISP chịu được ký tự đặc biệt -----------------
+import re as _re
+
+_MA_UNICODE_ACAD = _re.compile(r"\\{1,2}[Uu]\+([0-9A-Fa-f]{4})")
+_DAU_GACH_LE = _re.compile(r'\\(?!["\\/bfnrtu])')
+
+
+def _giai_ma_unicode(v):
+    """Đổi chuỗi dạng \\U+1EA2 mà AutoCAD trả về thành ký tự thật (Ả), đệ quy trong dict/list."""
+    if isinstance(v, str):
+        return _MA_UNICODE_ACAD.sub(lambda m: chr(int(m.group(1), 16)), v)
+    if isinstance(v, list):
+        return [_giai_ma_unicode(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _giai_ma_unicode(x) for k, x in v.items()}
+    return v
+
+
+def doc_ket_qua_json(text: str):
+    """Đọc file kết quả LISP.
+
+    AutoCAD có thể ghi tên layer, chữ tiếng Việt dạng \\U+XXXX và dấu \\ chưa thoát,
+    làm JSON không hợp lệ (bản gốc khi đó chờ tới hết giờ). Hàm này:
+      1. Đổi \\U+XXXX thành ký tự thật trước khi đọc.
+      2. Thoát các dấu \\ lẻ còn lại.
+      3. Giải mã \\U+XXXX còn sót trong giá trị sau khi đọc.
+    Vẫn lỗi thì ném json.JSONDecodeError như cũ.
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        sua = _MA_UNICODE_ACAD.sub(lambda m: chr(int(m.group(1), 16)), text)
+        sua = _DAU_GACH_LE.sub(r"\\\\", sua)
+        data = json.loads(sua)
+    return _giai_ma_unicode(data)
+STALE_THRESHOLD = 60.0  # clean up files older than this
+
+
+def find_autocad_window() -> int | None:
+    """Find the AutoCAD LT window handle by checking window titles."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import win32gui
+
+        windows: list[int] = []
+
+        def callback(hwnd, result):
+            if win32gui.IsWindowVisible(hwnd):
+                text = win32gui.GetWindowText(hwnd).lower()
+                if "autocad" in text and ("drawing" in text or ".dwg" in text):
+                    result.append(hwnd)
+            return True
+
+        win32gui.EnumWindows(callback, windows)
+        return windows[0] if windows else None
+    except ImportError:
+        return None
+
+
+class FileIPCBackend(AutoCADBackend):
+    """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
+
+    def __init__(self):
+        self._hwnd: int | None = None
+        self._command_hwnd: int | None = None
+        self._ipc_dir = Path(IPC_DIR)
+        self._screenshot_provider = None
+        self._acad_com = None  # COM handle for full AutoCAD (preferred trigger)
+        self._mac_app: str | None = None  # e.g. "AutoCAD 2025" on macOS
+        self._lock = asyncio.Lock()  # Single in-flight command
+
+    @property
+    def name(self) -> str:
+        return "file_ipc"
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            can_read_drawing=True,
+            can_modify_entities=True,
+            can_create_entities=True,
+            can_screenshot=True,
+            can_save=True,
+            can_plot_pdf=True,
+            can_zoom=True,
+            can_query_entities=True,
+            can_file_operations=True,
+            can_undo=True,
+        )
+
+    async def initialize(self) -> CommandResult:
+        """Find AutoCAD window and verify dispatcher is loaded."""
+        if sys.platform == "darwin":
+            from autocad_mcp.macos import MacScreenshotProvider, find_autocad_app
+
+            self._mac_app = find_autocad_app()
+            if not self._mac_app:
+                return CommandResult(
+                    ok=False,
+                    error=(
+                        "AutoCAD for Mac window not found "
+                        "(full AutoCAD required; AutoCAD LT for Mac has no AutoLISP)"
+                    ),
+                )
+            self._screenshot_provider = MacScreenshotProvider(self._mac_app)
+        else:
+            self._hwnd = find_autocad_window()
+            if not self._hwnd:
+                return CommandResult(ok=False, error="AutoCAD LT window not found")
+
+            # Set up screenshot provider
+            try:
+                from autocad_mcp.screenshot import Win32ScreenshotProvider
+
+                self._screenshot_provider = Win32ScreenshotProvider(self._hwnd)
+            except Exception:
+                pass
+
+            # Find command-line child edit control for focus-free dispatch
+            self._command_hwnd = self._find_command_line_hwnd()
+            log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+            # Full AutoCAD (non-LT) exposes a COM automation object. Using
+            # ActiveDocument.SendCommand is far more reliable than posting WM_CHAR
+            # to the command line, which silently fails on AutoCAD 2025.
+            self._acquire_com()
+
+        # Ensure IPC directory exists
+        self._ipc_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean up stale IPC files
+        self._cleanup_stale_files()
+
+        # Ping the dispatcher to verify it's loaded
+        result = await self._dispatch("ping", {})
+        if not result.ok:
+            lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+            mac_hint = (
+                "\nOn Mac also check Accessibility permission for the app running "
+                "this server (System Settings > Privacy & Security > Accessibility)."
+                if self._mac_app else ""
+            )
+            return CommandResult(
+                ok=False,
+                error=(
+                    "AutoCAD detected but mcp_dispatch.lsp not loaded.\n"
+                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
+                    "Or add lisp-code/ to trusted paths for auto-loading."
+                    f"{mac_hint}"
+                ),
+            )
+
+        return CommandResult(
+            ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd, "mac_app": self._mac_app}
+        )
+
+    async def status(self) -> CommandResult:
+        info = {
+            "backend": "file_ipc",
+            "hwnd": self._hwnd,
+            "mac_app": self._mac_app,
+            "ipc_dir": str(self._ipc_dir),
+            "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
+        }
+        return CommandResult(ok=True, payload=info)
+
+    # --- IPC dispatch ---
+
+    async def _dispatch(self, command: str, params: dict) -> CommandResult:
+        """Send a command via file IPC and wait for result."""
+        async with self._lock:
+            return await self._dispatch_unlocked(command, params)
+
+    async def _dispatch_unlocked(self, command: str, params: dict) -> CommandResult:
+        """Core IPC logic (must be called under _lock)."""
+        request_id = uuid.uuid4().hex[:12]
+        cmd_file = self._ipc_dir / f"autocad_mcp_cmd_{request_id}.json"
+        result_file = self._ipc_dir / f"autocad_mcp_result_{request_id}.json"
+        tmp_file = cmd_file.with_suffix(".tmp")
+
+        try:
+            # Strip None values — the simple LISP JSON parser can't handle null
+            clean_params = {k: v for k, v in params.items() if v is not None}
+            # Atomic write: write to .tmp, then rename
+            payload = {
+                "request_id": request_id,
+                "command": command,
+                "params": clean_params,
+                "ts": time.time(),
+            }
+            tmp_file.write_text(json.dumps(payload), encoding="utf-8")
+            tmp_file.rename(cmd_file)
+
+            # Type the fixed dispatch trigger
+            self._type_dispatch_trigger()
+
+            # Poll for result
+            deadline = time.time() + TIMEOUT
+            while time.time() < deadline:
+                if result_file.exists():
+                    try:
+                        # AutoCAD LISP writes files in Windows-1252 encoding;
+                        # try UTF-8 first (covers ASCII), fall back to cp1252
+                        try:
+                            text = result_file.read_text(encoding="utf-8")
+                        except UnicodeDecodeError:
+                            text = result_file.read_text(encoding="cp1252")
+                        data = doc_ket_qua_json(text)
+                        # Verify request_id matches
+                        if data.get("request_id") == request_id:
+                            return CommandResult(
+                                ok=data.get("ok", False),
+                                payload=data.get("payload"),
+                                error=data.get("error"),
+                            )
+                    except (json.JSONDecodeError, OSError):
+                        pass  # File may be partially written, retry
+                await asyncio.sleep(POLL_INTERVAL)
+
+            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
+
+        finally:
+            # Cleanup
+            for f in (cmd_file, result_file, tmp_file):
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _find_command_line_hwnd(self) -> int | None:
+        """Find AutoCAD's MDIClient child window for command routing."""
+        if sys.platform != "win32" or not self._hwnd:
+            return None
+        try:
+            import win32gui
+
+            mdi_client: list[int] = []
+
+            def cb(child_hwnd, _):
+                if win32gui.GetClassName(child_hwnd) == "MDIClient":
+                    mdi_client.append(child_hwnd)
+                    return False  # stop enumeration
+                return True
+
+            win32gui.EnumChildWindows(self._hwnd, cb, None)
+            return mdi_client[0] if mdi_client else None
+        except Exception:
+            return None
+
+    def _acquire_com(self):
+        """Try to grab the running full-AutoCAD COM object (None on LT/failure)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import pythoncom  # noqa: F401  (ensures COM is initialized in this thread)
+            import win32com.client
+
+            self._acad_com = win32com.client.GetActiveObject("AutoCAD.Application")
+            log.info("com_acquired", name=str(self._acad_com.Name))
+        except Exception as e:
+            self._acad_com = None
+            log.info("com_unavailable", error=str(e))
+
+    def _type_dispatch_trigger(self):
+        """Trigger '(c:mcp-dispatch)' in AutoCAD.
+
+        Prefers COM ActiveDocument.SendCommand (reliable on full AutoCAD).
+        Falls back to posting WM_CHAR to the command line for LT, which has
+        no COM automation interface. On macOS, types the MCPD alias into
+        AutoCAD for Mac via System Events.
+        """
+        if self._mac_app:
+            from autocad_mcp.macos import send_trigger
+
+            send_trigger(self._mac_app)
+            return
+
+        # Preferred path: COM SendCommand (full AutoCAD)
+        if self._acad_com is not None:
+            try:
+                import pythoncom
+
+                pythoncom.CoInitialize()
+                self._acad_com.ActiveDocument.SendCommand("(c:mcp-dispatch) ")
+                return
+            except Exception as e:
+                log.error("com_dispatch_failed", error=str(e))
+                self._acad_com = None  # fall through to WM_CHAR
+
+        # Fallback path: post keystrokes to the command line (AutoCAD LT)
+        try:
+            import ctypes
+
+            WM_CHAR = 0x0102
+            WM_KEYDOWN = 0x0100
+            WM_KEYUP = 0x0101
+            VK_ESCAPE = 0x1B
+            target = self._command_hwnd or self._hwnd
+            post = ctypes.windll.user32.PostMessageW
+
+            # Cancel any pending command (2x ESC for nested commands)
+            for _ in range(2):
+                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
+                post(target, WM_KEYUP, VK_ESCAPE, 0)
+            time.sleep(0.05)
+
+            for ch in "(c:mcp-dispatch)":
+                post(target, WM_CHAR, ord(ch), 0)
+            # Enter = carriage return
+            post(target, WM_CHAR, 0x0D, 0)
+            time.sleep(0.05)
+        except Exception as e:
+            log.error("dispatch_trigger_failed", error=str(e))
+
+    def _cleanup_stale_files(self):
+        """Remove stale IPC files from previous sessions."""
+        try:
+            now = time.time()
+            for pattern in ("autocad_mcp_*.json", "autocad_mcp_*.tmp", "autocad_mcp_lisp_*.lsp", "autocad_mcp_batch_*.txt"):
+                for f in self._ipc_dir.glob(pattern):
+                    if now - f.stat().st_mtime > STALE_THRESHOLD:
+                        f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    # --- Drawing management ---
+
+    async def drawing_info(self) -> CommandResult:
+        return await self._dispatch("drawing-info", {})
+
+    async def drawing_save(self, path: str | None = None) -> CommandResult:
+        return await self._dispatch("drawing-save", {"path": path})
+
+    async def drawing_save_as_dxf(self, path: str) -> CommandResult:
+        return await self._dispatch("drawing-save-as-dxf", {"path": path})
+
+    async def drawing_create(self, name: str | None = None) -> CommandResult:
+        return await self._dispatch("drawing-create", {"name": name})
+
+    async def drawing_purge(self) -> CommandResult:
+        return await self._dispatch("drawing-purge", {})
+
+    async def drawing_plot_pdf(self, path: str) -> CommandResult:
+        # Ban HP: kho A3 ngang, in theo CTB; doi CTB bang bien moi truong HP_MCP_CTB
+        return await self._dispatch("drawing-plot-pdf", {
+            "path": path.replace("\\", "/"),
+            "ctb": os.environ.get("HP_MCP_CTB", "monochrome.ctb"),
+        })
+
+    async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
+        if names:
+            # Strip $ prefix for AutoCAD compatibility (ezdxf uses $ACADVER, AutoCAD uses ACADVER)
+            clean_names = [n.lstrip("$") for n in names]
+            names_str = ";".join(clean_names)
+        else:
+            names_str = ""
+        return await self._dispatch("drawing-get-variables", {"names_str": names_str})
+
+    async def drawing_open(self, path: str) -> CommandResult:
+        return await self._dispatch("drawing-open", {"path": path})
+
+    # --- Undo / Redo ---
+
+    async def undo(self) -> CommandResult:
+        return await self._dispatch("undo", {})
+
+    async def redo(self) -> CommandResult:
+        return await self._dispatch("redo", {})
+
+    # --- Freehand LISP execution ---
+
+    async def execute_lisp(self, code: str) -> CommandResult:
+        """Execute arbitrary AutoLISP code via temp file.
+
+        File persists for session; cleaned up by _cleanup_stale_files().
+        """
+        request_id = uuid.uuid4().hex[:12]
+        code_file = self._ipc_dir / f"autocad_mcp_lisp_{request_id}.lsp"
+        code_file.write_text(code, encoding="utf-8")
+        return await self._dispatch("execute-lisp", {
+            "code_file": str(code_file).replace("\\", "/")
+        })
+
+    async def batch(self, commands: list[dict]) -> CommandResult:
+        """Run many whitelisted commands in one dispatch, wrapped in one UNDO group.
+
+        Each item: {"command": "<dispatcher-name>", "params": {...}}, e.g.
+        {"command": "create-line", "params": {"x1": 0, "y1": 0, "x2": 100, "y2": 0}}.
+        Commands are written to a tab-delimited file (one per line) and executed
+        by the LISP 'batch' handler. json.dumps keeps text ASCII-safe (\\uXXXX),
+        which the dispatcher decodes to AutoCAD Unicode.
+        """
+        if not commands:
+            return CommandResult(ok=False, error="commands list is empty")
+
+        request_id = uuid.uuid4().hex[:12]
+        batch_file = self._ipc_dir / f"autocad_mcp_batch_{request_id}.txt"
+        lines = []
+        for c in commands:
+            cmd = c.get("command")
+            if not cmd:
+                continue
+            params = {k: v for k, v in (c.get("params") or {}).items() if v is not None}
+            # json.dumps has no literal tabs/newlines (they are escaped), so a
+            # tab is a safe field separator and one command == one line.
+            lines.append(f"{cmd}\t{json.dumps(params)}")
+
+        batch_file.write_text("\n".join(lines), encoding="utf-8")
+        try:
+            return await self._dispatch("batch", {
+                "batch_file": str(batch_file).replace("\\", "/")
+            })
+        finally:
+            try:
+                batch_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    # --- Entity operations ---
+
+    async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:
+        return await self._dispatch("create-line", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+
+    async def create_circle(self, cx, cy, radius, layer=None) -> CommandResult:
+        return await self._dispatch("create-circle", {"cx": cx, "cy": cy, "radius": radius, "layer": layer})
+
+    async def create_polyline(self, points, closed=False, layer=None) -> CommandResult:
+        pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
+        return await self._dispatch("create-polyline", {
+            "points_str": pts_str, "closed": "1" if closed else "0", "layer": layer
+        })
+
+    async def create_rectangle(self, x1, y1, x2, y2, layer=None) -> CommandResult:
+        return await self._dispatch("create-rectangle", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+
+    async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None) -> CommandResult:
+        return await self._dispatch("create-arc", {"cx": cx, "cy": cy, "radius": radius, "start_angle": start_angle, "end_angle": end_angle, "layer": layer})
+
+    async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None) -> CommandResult:
+        return await self._dispatch("create-ellipse", {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio, "layer": layer})
+
+    async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
+        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer})
+
+    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
+        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern})
+
+    async def entity_list(self, layer=None) -> CommandResult:
+        return await self._dispatch("entity-list", {"layer": layer})
+
+    async def entity_count(self, layer=None) -> CommandResult:
+        return await self._dispatch("entity-count", {"layer": layer})
+
+    async def entity_get(self, entity_id) -> CommandResult:
+        return await self._dispatch("entity-get", {"entity_id": entity_id})
+
+    async def entity_erase(self, entity_id) -> CommandResult:
+        return await self._dispatch("entity-erase", {"entity_id": entity_id})
+
+    async def entity_copy(self, entity_id, dx, dy) -> CommandResult:
+        return await self._dispatch("entity-copy", {"entity_id": entity_id, "dx": dx, "dy": dy})
+
+    async def entity_move(self, entity_id, dx, dy) -> CommandResult:
+        return await self._dispatch("entity-move", {"entity_id": entity_id, "dx": dx, "dy": dy})
+
+    async def entity_rotate(self, entity_id, cx, cy, angle) -> CommandResult:
+        return await self._dispatch("entity-rotate", {"entity_id": entity_id, "cx": cx, "cy": cy, "angle": angle})
+
+    async def entity_scale(self, entity_id, cx, cy, factor) -> CommandResult:
+        return await self._dispatch("entity-scale", {"entity_id": entity_id, "cx": cx, "cy": cy, "factor": factor})
+
+    async def entity_mirror(self, entity_id, x1, y1, x2, y2) -> CommandResult:
+        return await self._dispatch("entity-mirror", {"entity_id": entity_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def entity_offset(self, entity_id, distance) -> CommandResult:
+        return await self._dispatch("entity-offset", {"entity_id": entity_id, "distance": distance})
+
+    async def entity_array(self, entity_id, rows, cols, row_dist, col_dist) -> CommandResult:
+        return await self._dispatch("entity-array", {"entity_id": entity_id, "rows": rows, "cols": cols, "row_dist": row_dist, "col_dist": col_dist})
+
+    async def entity_fillet(self, entity_id1, entity_id2, radius) -> CommandResult:
+        return await self._dispatch("entity-fillet", {"id1": entity_id1, "id2": entity_id2, "radius": radius})
+
+    async def entity_chamfer(self, entity_id1, entity_id2, dist1, dist2) -> CommandResult:
+        return await self._dispatch("entity-chamfer", {"id1": entity_id1, "id2": entity_id2, "dist1": dist1, "dist2": dist2})
+
+    # --- Layer operations ---
+
+    async def layer_list(self) -> CommandResult:
+        return await self._dispatch("layer-list", {})
+
+    async def layer_create(self, name, color="white", linetype="CONTINUOUS") -> CommandResult:
+        return await self._dispatch("layer-create", {"name": name, "color": color, "linetype": linetype})
+
+    async def layer_set_current(self, name) -> CommandResult:
+        return await self._dispatch("layer-set-current", {"name": name})
+
+    async def layer_set_properties(self, name, color=None, linetype=None, lineweight=None) -> CommandResult:
+        return await self._dispatch("layer-set-properties", {"name": name, "color": color, "linetype": linetype, "lineweight": lineweight})
+
+    async def layer_freeze(self, name) -> CommandResult:
+        return await self._dispatch("layer-freeze", {"name": name})
+
+    async def layer_thaw(self, name) -> CommandResult:
+        return await self._dispatch("layer-thaw", {"name": name})
+
+    async def layer_lock(self, name) -> CommandResult:
+        return await self._dispatch("layer-lock", {"name": name})
+
+    async def layer_unlock(self, name) -> CommandResult:
+        return await self._dispatch("layer-unlock", {"name": name})
+
+    # --- Block operations ---
+
+    async def block_list(self) -> CommandResult:
+        return await self._dispatch("block-list", {})
+
+    async def block_insert(self, name, x, y, scale=1.0, rotation=0.0, block_id=None) -> CommandResult:
+        return await self._dispatch("block-insert", {"name": name, "x": x, "y": y, "scale": scale, "rotation": rotation, "block_id": block_id})
+
+    async def block_insert_with_attributes(self, name, x, y, scale=1.0, rotation=0.0, attributes=None) -> CommandResult:
+        return await self._dispatch("block-insert-with-attributes", {"name": name, "x": x, "y": y, "scale": scale, "rotation": rotation, "attributes": attributes or {}})
+
+    async def block_get_attributes(self, entity_id) -> CommandResult:
+        return await self._dispatch("block-get-attributes", {"entity_id": entity_id})
+
+    async def block_update_attribute(self, entity_id, tag, value) -> CommandResult:
+        return await self._dispatch("block-update-attribute", {"entity_id": entity_id, "tag": tag, "value": value})
+
+    async def block_define(self, name, entities) -> CommandResult:
+        return await self._dispatch("block-define", {"name": name, "entities": entities})
+
+    # --- Annotation ---
+
+    async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:
+        return await self._dispatch("create-text", {"x": x, "y": y, "text": text, "height": height, "rotation": rotation, "layer": layer})
+
+    async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
+        return await self._dispatch("create-dimension-linear", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "dim_x": dim_x, "dim_y": dim_y})
+
+    async def create_dimension_aligned(self, x1, y1, x2, y2, offset) -> CommandResult:
+        return await self._dispatch("create-dimension-aligned", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "offset": offset})
+
+    async def create_dimension_angular(self, cx, cy, x1, y1, x2, y2) -> CommandResult:
+        return await self._dispatch("create-dimension-angular", {"cx": cx, "cy": cy, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def create_dimension_radius(self, cx, cy, radius, angle) -> CommandResult:
+        return await self._dispatch("create-dimension-radius", {"cx": cx, "cy": cy, "radius": radius, "angle": angle})
+
+    async def create_leader(self, points, text) -> CommandResult:
+        pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
+        return await self._dispatch("create-leader", {"points_str": pts_str, "text": text})
+
+    # --- P&ID ---
+
+    async def pid_setup_layers(self) -> CommandResult:
+        return await self._dispatch("pid-setup-layers", {})
+
+    async def pid_insert_symbol(self, category, symbol, x, y, scale=1.0, rotation=0.0) -> CommandResult:
+        return await self._dispatch("pid-insert-symbol", {"category": category, "symbol": symbol, "x": x, "y": y, "scale": scale, "rotation": rotation})
+
+    async def pid_list_symbols(self, category) -> CommandResult:
+        return await self._dispatch("pid-list-symbols", {"category": category})
+
+    async def pid_draw_process_line(self, x1, y1, x2, y2) -> CommandResult:
+        return await self._dispatch("pid-draw-process-line", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def pid_connect_equipment(self, x1, y1, x2, y2) -> CommandResult:
+        return await self._dispatch("pid-connect-equipment", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def pid_add_flow_arrow(self, x, y, rotation=0.0) -> CommandResult:
+        return await self._dispatch("pid-add-flow-arrow", {"x": x, "y": y, "rotation": rotation})
+
+    async def pid_add_equipment_tag(self, x, y, tag, description="") -> CommandResult:
+        return await self._dispatch("pid-add-equipment-tag", {"x": x, "y": y, "tag": tag, "description": description})
+
+    async def pid_add_line_number(self, x, y, line_num, spec) -> CommandResult:
+        return await self._dispatch("pid-add-line-number", {"x": x, "y": y, "line_num": line_num, "spec": spec})
+
+    async def pid_insert_valve(self, x, y, valve_type, rotation=0.0, attributes=None) -> CommandResult:
+        return await self._dispatch("pid-insert-valve", {"x": x, "y": y, "valve_type": valve_type, "rotation": rotation, "attributes": attributes or {}})
+
+    async def pid_insert_instrument(self, x, y, instrument_type, rotation=0.0, tag_id="", range_value="") -> CommandResult:
+        return await self._dispatch("pid-insert-instrument", {"x": x, "y": y, "instrument_type": instrument_type, "rotation": rotation, "tag_id": tag_id, "range_value": range_value})
+
+    async def pid_insert_pump(self, x, y, pump_type, rotation=0.0, attributes=None) -> CommandResult:
+        return await self._dispatch("pid-insert-pump", {"x": x, "y": y, "pump_type": pump_type, "rotation": rotation, "attributes": attributes or {}})
+
+    async def pid_insert_tank(self, x, y, tank_type, scale=1.0, attributes=None) -> CommandResult:
+        return await self._dispatch("pid-insert-tank", {"x": x, "y": y, "tank_type": tank_type, "scale": scale, "attributes": attributes or {}})
+
+    # --- View ---
+
+    async def zoom_extents(self) -> CommandResult:
+        return await self._dispatch("zoom-extents", {})
+
+    async def zoom_window(self, x1, y1, x2, y2) -> CommandResult:
+        return await self._dispatch("zoom-window", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def get_screenshot(self) -> CommandResult:
+        if self._screenshot_provider:
+            data = self._screenshot_provider.capture()
+            if data:
+                return CommandResult(ok=True, payload=data)
+        return CommandResult(ok=False, error="Screenshot capture failed")
